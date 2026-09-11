@@ -3,18 +3,19 @@ import os
 from dotenv import load_dotenv
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from supabase import create_client
+import threading
 
 load_dotenv()
 
-# =============================================================================
+# ============================================================
 # CONFIG
-# =============================================================================
+# ============================================================
 
-OCEANHELM_RAW_WS = os.getenv(
-    "OCEANHELM_RAW_WS",
-    "wss://stream.oceanhelmtech.com/ws/decoded"
+OCEANHELM_WS_URL = os.getenv(
+    "OCEANHELM_WS_URL",
+    "ws://127.0.0.1:9000/ws/stream"
 )
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -24,15 +25,33 @@ BATCH_SIZE = 50
 FLUSH_INTERVAL = 5
 RECONNECT_DELAY = 3
 
-# =============================================================================
+# OceanHelm Africa bounding box
+#
+# [west, south, east, north]
+#
+# west  = -35
+# south = -20
+# east  = 55
+# north = 37
+#
+AFRICA_BBOX = [-35, -20, 55, 37]
+
+AIS_MESSAGE_TYPES = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    9,
+    18,
+    19,
+    21,
+    24
+]
+
+# ============================================================
 # INIT
-# =============================================================================
-
-if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL is not configured")
-
-if not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_KEY is not configured")
+# ============================================================
 
 supabase = create_client(
     SUPABASE_URL,
@@ -43,15 +62,15 @@ position_batch = []
 
 last_flush_time = time.time()
 
-# Prevent processing the exact same MMSI/timestamp twice.
 last_seen = {}
 
+batch_lock = threading.Lock()
 
-# =============================================================================
+# ============================================================
 # AFRICAN VESSEL MMSI CACHE
 #
 # Cache loaded at startup and refreshed every 10 minutes.
-# =============================================================================
+# ============================================================
 
 african_vessel_mmsi_cache = set()
 
@@ -77,7 +96,10 @@ def refresh_african_vessel_cache():
             result = (
                 supabase
                 .rpc("get_african_vessel_mmsi")
-                .range(start, start + page_size - 1)
+                .range(
+                    start,
+                    start + page_size - 1
+                )
                 .execute()
             )
 
@@ -99,7 +121,7 @@ def refresh_african_vessel_cache():
         last_cache_refresh = time.time()
 
         print(
-            f"✅ African vessel cache refreshed: "
+            "✅ African vessel cache refreshed: "
             f"{len(african_vessel_mmsi_cache)} vessels"
         )
 
@@ -121,29 +143,42 @@ def is_african_owned(mmsi):
     return mmsi in african_vessel_mmsi_cache
 
 
-# =============================================================================
+# ============================================================
 # HELPERS
-# =============================================================================
+# ============================================================
 
 def parse_timestamp(ts):
 
     if not ts:
         return None
 
-    if not isinstance(ts, str):
-        return None
-
-    ts = ts.replace(" UTC", "").strip()
-
     try:
 
-        return datetime.fromisoformat(ts).isoformat()
+        if isinstance(ts, str):
+
+            ts = ts.replace(
+                " UTC",
+                ""
+            ).strip()
+
+            return datetime.fromisoformat(
+                ts.replace(
+                    "Z",
+                    "+00:00"
+                )
+            ).isoformat()
+
+        return datetime.now(
+            timezone.utc
+        ).isoformat()
 
     except Exception as e:
 
         print(
-            f"Timestamp parse error: "
-            f"{e} | raw: {ts}"
+            "Timestamp parse error:",
+            e,
+            "| raw:",
+            ts
         )
 
         return None
@@ -151,39 +186,41 @@ def parse_timestamp(ts):
 
 def get_region(lat, lon):
 
-    if lat is None or lon is None:
-        return None
-
-    # Port Harcourt / Gulf of Guinea area
-    if 4 <= lat <= 6 and 6 <= lon <= 8:
+    if (
+        4 <= lat <= 6
+        and 6 <= lon <= 8
+    ):
         return "Port Harcourt, Nigeria"
 
-    # Lagos
-    if 6 <= lat <= 7 and 3 <= lon <= 4:
+    if (
+        6 <= lat <= 7
+        and 3 <= lon <= 4
+    ):
         return "Lagos, Nigeria"
 
-    # Africa
     in_africa = (
         -35 <= lon <= 55
         and
         -20 <= lat <= 37
     )
 
-    if in_africa:
-        return "Africa"
+    return (
+        "Africa"
+        if in_africa
+        else
+        "International Waters"
+    )
 
-    return "International Waters"
 
-
-# =============================================================================
+# ============================================================
 # VESSEL UPSERT
-# =============================================================================
+# ============================================================
 
 def upsert_vessel(
     mmsi,
-    imo,
-    name,
-    vessel_type
+    imo=None,
+    name=None,
+    vessel_type=None
 ):
 
     vessel_row = {
@@ -191,40 +228,51 @@ def upsert_vessel(
         "imo_number": imo,
         "name": name,
         "vessel_type": vessel_type,
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at":
+            datetime.now(
+                timezone.utc
+            ).isoformat()
     }
 
     try:
 
-        supabase \
-            .table("vessels") \
+        (
+            supabase
+            .table("vessels")
             .upsert(
                 vessel_row,
                 on_conflict="mmsi"
-            ) \
+            )
             .execute()
+        )
 
     except Exception as e:
 
         print(
-            f"❌ Vessel upsert error "
-            f"(mmsi={mmsi}): {e}"
+            "Vessel upsert error:",
+            e
         )
 
 
-# =============================================================================
+# ============================================================
 # BATCH FLUSH
-# =============================================================================
+# ============================================================
 
 def flush_batch():
 
     global position_batch
     global last_flush_time
 
-    if not position_batch:
-        return
+    with batch_lock:
 
-    batch = position_batch
+        if not position_batch:
+            return
+
+        batch = position_batch.copy()
+
+        position_batch.clear()
+
+        last_flush_time = time.time()
 
     try:
 
@@ -236,8 +284,7 @@ def flush_batch():
         )
 
         print(
-            f"✅ Flushed "
-            f"{len(batch)} positions"
+            f"✅ Flushed {len(batch)} positions"
         )
 
     except Exception as e:
@@ -246,10 +293,7 @@ def flush_batch():
             f"❌ Batch insert error: {e}"
         )
 
-        # Fallback:
-        # Try each row individually so one bad row
-        # doesn't destroy the entire batch.
-
+        # Retry individually.
         for row in batch:
 
             try:
@@ -264,38 +308,15 @@ def flush_batch():
             except Exception as row_e:
 
                 print(
-                    f"  ❌ Failed row "
+                    "  ❌ Failed row "
                     f"mmsi={row.get('mmsi')}: "
                     f"{row_e}"
                 )
 
-    finally:
 
-        position_batch.clear()
-
-        last_flush_time = time.time()
-
-
-# =============================================================================
-# DECODED AIS MESSAGE HANDLER
-#
-# Node.js has already decoded the NMEA.
-#
-# Expected structure:
-#
-# {
-#     "receiver_id": "receiver-001",
-#     "timestamp": "...",
-#     "type": "ais",
-#     "ais_message_type": 1,
-#     "ais": {
-#         "mmsi": 636093408,
-#         "lat": 4.6947,
-#         "lon": 7.1755,
-#         ...
-#     }
-# }
-# =============================================================================
+# ============================================================
+# CORE OCEANHELM MESSAGE HANDLER
+# ============================================================
 
 def handle_message(data):
 
@@ -304,41 +325,40 @@ def handle_message(data):
     if not isinstance(data, dict):
         return
 
-    # -------------------------------------------------------------------------
-    # Only accept decoded AIS messages.
-    #
-    # GPS should never reach this service because Node.js drops GPS before
-    # broadcasting.
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
+    # Ignore OceanHelm control messages
+    # --------------------------------------------------------
 
     if data.get("type") != "ais":
         return
 
-    ais = data.get("ais")
-
-    if not isinstance(ais, dict):
-        return
-
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
     # MMSI
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
 
-    mmsi = ais.get("mmsi")
+    mmsi = data.get("mmsi")
 
     if not mmsi:
         return
 
     try:
         mmsi = int(mmsi)
-    except (TypeError, ValueError):
+    except Exception:
         return
 
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
     # Position
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
 
-    lat = ais.get("lat")
-    lon = ais.get("lon")
+    position = data.get(
+        "position"
+    )
+
+    if not position:
+        return
+
+    lat = position.get("lat")
+    lon = position.get("lon")
 
     if lat is None or lon is None:
         return
@@ -348,56 +368,76 @@ def handle_message(data):
         lat = float(lat)
         lon = float(lon)
 
-    except (TypeError, ValueError):
+    except Exception:
 
         return
 
-    # -------------------------------------------------------------------------
-    # African vessel filter
+    # --------------------------------------------------------
+    # African-owned gate
     #
-    # Unlike before, this is the ONLY feed we receive.
+    # OceanHelm already applies the Africa bbox.
     #
-    # If you want all vessels received by your receivers, remove this gate.
-    #
-    # For now we preserve your old behavior:
-    # only African-owned vessels go into Supabase.
-    # -------------------------------------------------------------------------
+    # This gate is retained because your existing pipeline
+    # deliberately stores only African-owned vessels for this
+    # processing path.
+    # --------------------------------------------------------
 
     if not is_african_owned(mmsi):
 
         return
 
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
     # Timestamp
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
 
-    timestamp = data.get("timestamp")
+    timestamp = data.get(
+        "timestamp"
+    )
 
-    # -------------------------------------------------------------------------
-    # Deduplication
-    #
-    # Node.js may aggregate multiple receivers.
-    #
-    # The same vessel can therefore potentially arrive from multiple
-    # receivers at nearly the same time.
-    # -------------------------------------------------------------------------
-
-    dedupe_key = (
-        mmsi,
+    timestamp = parse_timestamp(
         timestamp
     )
 
-    if dedupe_key in last_seen:
+    # --------------------------------------------------------
+    # Duplicate protection
+    # --------------------------------------------------------
+
+    duplicate_key = (
+        timestamp
+        if timestamp
+        else f"{lat}:{lon}"
+    )
+
+    if (
+        mmsi in last_seen
+        and
+        last_seen[mmsi] == duplicate_key
+    ):
 
         return
 
-    last_seen[dedupe_key] = True
+    last_seen[mmsi] = duplicate_key
 
-    # -------------------------------------------------------------------------
-    # Speed
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
+    # Navigation
+    # --------------------------------------------------------
 
-    speed = ais.get("speedOverGround")
+    navigation = data.get(
+        "navigation"
+    ) or {}
+
+    speed = navigation.get(
+        "speed"
+    )
+
+    course = navigation.get(
+        "course"
+    )
+
+    # --------------------------------------------------------
+    # Existing behaviour:
+    # Ignore vessels moving slower than 0.3 knots.
+    # --------------------------------------------------------
 
     if speed is not None:
 
@@ -405,106 +445,125 @@ def handle_message(data):
 
             speed = float(speed)
 
-        except (TypeError, ValueError):
+            if speed < 0.3:
+                return
+
+        except Exception:
 
             speed = None
 
-    # -------------------------------------------------------------------------
-    # Preserve your old rule:
-    # ignore vessels moving below 0.3 knots.
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
+    # Vessel information
+    # --------------------------------------------------------
 
-    if speed is not None and speed < 0.3:
+    vessel = data.get(
+        "vessel"
+    ) or {}
 
-        return
+    name = vessel.get(
+        "name"
+    )
 
-    # -------------------------------------------------------------------------
-    # Vessel metadata
-    #
-    # Position AIS messages normally don't contain static data.
-    #
-    # Node.js may eventually provide static AIS messages separately.
-    # -------------------------------------------------------------------------
+    imo = vessel.get(
+        "imo"
+    )
 
-    name = ais.get("name")
-    imo = ais.get("imo")
-    vessel_type = ais.get("vesselType")
+    vessel_type = vessel.get(
+        "vessel_type"
+    )
 
-    # -------------------------------------------------------------------------
-    # Vessel metadata update
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
+    # Upsert vessel master record
+    # --------------------------------------------------------
+
+    upsert_vessel(
+        mmsi=mmsi,
+        imo=imo,
+        name=name,
+        vessel_type=vessel_type
+    )
+
+    # --------------------------------------------------------
+    # Queue position
+    # --------------------------------------------------------
+
+    row = {
+        "mmsi": mmsi,
+        "lat": lat,
+        "lon": lon,
+        "speed": speed,
+        "course": course,
+        "location_name":
+            get_region(
+                lat,
+                lon
+            ),
+        "timestamp": timestamp
+    }
+
+    with batch_lock:
+
+        position_batch.append(
+            row
+        )
+
+        batch_size = len(
+            position_batch
+        )
+
+    # --------------------------------------------------------
+    # Flush conditions
+    # --------------------------------------------------------
 
     if (
-        name is not None
-        or imo is not None
-        or vessel_type is not None
+        batch_size >= BATCH_SIZE
+        or
+        (
+            time.time()
+            - last_flush_time
+            > FLUSH_INTERVAL
+        )
     ):
 
-        upsert_vessel(
-            mmsi=mmsi,
-            imo=imo,
-            name=name,
-            vessel_type=vessel_type
-        )
-
-    # -------------------------------------------------------------------------
-    # Create Supabase position record
-    # -------------------------------------------------------------------------
-
-    position_batch.append({
-
-        "mmsi": mmsi,
-
-        "lat": lat,
-
-        "lon": lon,
-
-        "speed": speed,
-
-        "course": ais.get(
-            "courseOverGround"
-        ),
-
-        "location_name": get_region(
-            lat,
-            lon
-        ),
-
-        "timestamp": parse_timestamp(
-            timestamp
-        )
-    })
+        flush_batch()
 
 
-# =============================================================================
-# WEBSOCKET CONNECTION
-#
-# Python now connects to OceanHelm.
-#
-# Node.js is responsible for:
-#   - receiving receiver streams
-#   - dropping GPS
-#   - decoding AIS
-#   - aggregating
-#   - broadcasting decoded AIS
-# =============================================================================
+# ============================================================
+# OCEANHELM WEBSOCKET
+# ============================================================
 
 def make_ws():
 
     def on_open(ws):
 
         print(
-            "🌊 Connected to OceanHelm "
-            "decoded AIS stream"
+            "🌊 OceanHelm AIS connection open"
+        )
+
+        payload = {
+            "action": "subscribe",
+
+            "bbox": AFRICA_BBOX,
+
+            "message_types":
+                AIS_MESSAGE_TYPES
+        }
+
+        ws.send(
+            json.dumps(
+                payload
+            )
         )
 
         print(
-            f"Stream: {OCEANHELM_RAW_WS}"
+            "📡 Subscribed to OceanHelm "
+            "African AIS stream"
         )
 
-    def on_message(ws, message):
-
-        global last_flush_time
+    def on_message(
+        ws,
+        message
+    ):
 
         try:
 
@@ -512,53 +571,69 @@ def make_ws():
                 message
             )
 
-            handle_message(data)
+            # --------------------------------------------
+            # Connection acknowledgement
+            # --------------------------------------------
 
-        except json.JSONDecodeError as e:
+            if data.get(
+                "type"
+            ) == "connection_ack":
 
-            print(
-                f"⚠️ Invalid JSON from "
-                f"OceanHelm stream: {e}"
+                print(
+                    "✅ OceanHelm stream "
+                    "connection acknowledged"
+                )
+
+                return
+
+            # --------------------------------------------
+            # Subscription acknowledgement
+            # --------------------------------------------
+
+            if data.get(
+                "type"
+            ) == "subscription":
+
+                print(
+                    "✅ OceanHelm subscription:",
+                    data
+                )
+
+                return
+
+            # --------------------------------------------
+            # AIS
+            # --------------------------------------------
+
+            handle_message(
+                data
             )
-
-            return
 
         except Exception as e:
 
             print(
-                f"⚠️ Message processing error: "
-                f"{e}"
+                "Message error:",
+                e
             )
 
-            return
-
-        # ---------------------------------------------------------------------
-        # Flush based on size OR time
-        # ---------------------------------------------------------------------
-
-        if (
-            len(position_batch) >= BATCH_SIZE
-            or
-            (
-                time.time()
-                - last_flush_time
-                > FLUSH_INTERVAL
-            )
-        ):
-
-            flush_batch()
-
-    def on_error(ws, error):
+    def on_error(
+        ws,
+        error
+    ):
 
         print(
-            f"⚠️ OceanHelm WebSocket error: "
-            f"{error}"
+            "⚠️ OceanHelm WebSocket error:",
+            error
         )
 
-    def on_close(ws, code, msg):
+    def on_close(
+        ws,
+        code,
+        msg
+    ):
 
         print(
-            f"🔌 OceanHelm stream closed "
+            "🔌 OceanHelm connection closed "
             f"({code}): {msg}"
         )
 
@@ -569,7 +644,7 @@ def make_ws():
 
     return websocket.WebSocketApp(
 
-        OCEANHELM_RAW_WS,
+        OCEANHELM_WS_URL,
 
         on_open=on_open,
 
@@ -581,15 +656,20 @@ def make_ws():
     )
 
 
-# =============================================================================
+# ============================================================
 # RECONNECT RUNNER
-# =============================================================================
+# ============================================================
 
 def run_connection():
 
     while True:
 
         try:
+
+            print(
+                f"🔗 Connecting to "
+                f"{OCEANHELM_WS_URL}"
+            )
 
             ws = make_ws()
 
@@ -601,8 +681,8 @@ def run_connection():
         except Exception as e:
 
             print(
-                f"❌ Fatal OceanHelm "
-                f"stream error: {e}"
+                "❌ Fatal OceanHelm "
+                f"WebSocket error: {e}"
             )
 
         time.sleep(
@@ -610,56 +690,51 @@ def run_connection():
         )
 
 
-# =============================================================================
+# ============================================================
 # START
-# =============================================================================
+# ============================================================
 
 if __name__ == "__main__":
 
     print(
-        "========================================"
+        "🚢 OceanHelm AIS Python pipeline"
     )
 
     print(
-        "OceanHelm AIS Processing Worker"
+        f"WebSocket: {OCEANHELM_WS_URL}"
     )
 
-    print(
-        "========================================"
-    )
-
-    print(
-        f"Input: {OCEANHELM_RAW_WS}"
-    )
-
-    print(
-        f"Batch size: {BATCH_SIZE}"
-    )
-
-    print(
-        f"Flush interval: {FLUSH_INTERVAL}s"
-    )
-
-    print()
-
-    # -------------------------------------------------------------------------
-    # Load African vessel cache BEFORE connecting.
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
+    # Pre-load African vessel cache
+    # --------------------------------------------------------
 
     refresh_african_vessel_cache()
 
-    # -------------------------------------------------------------------------
-    # Connect to OceanHelm.
-    # -------------------------------------------------------------------------
+    # --------------------------------------------------------
+    # Start OceanHelm stream
+    # --------------------------------------------------------
+
+    stream_thread = threading.Thread(
+        target=run_connection,
+        daemon=True
+    )
+
+    stream_thread.start()
+
+    # --------------------------------------------------------
+    # Keep process alive
+    # --------------------------------------------------------
 
     try:
 
-        run_connection()
+        while True:
+
+            time.sleep(1)
 
     except KeyboardInterrupt:
 
         print(
-            "\n🛑 Shutting down..."
+            "🛑 Shutting down..."
         )
 
         flush_batch()
